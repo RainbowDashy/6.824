@@ -33,7 +33,7 @@ func (m *Master) waitmap(i int) {
 
 func (m *Master) waitreduce(i int) {
 	fmt.Println("Reduce ", i)
-	time.Sleep(20 * time.Second)
+	time.Sleep(10 * time.Second)
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	if m.reducetask[i] == 1 {
@@ -81,6 +81,7 @@ func (m *Master) JAlloc(args *JobRequest, reply *JobReply) error {
 func (m *Master) JReport(args *JobReport, reply *JobReply) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
+	reply.Job = 0
 	switch args.Job {
 	case 1:
 		m.maptask[args.Id] = 2
@@ -122,8 +123,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := m.done
-	return ret
+	return m.done
 }
 
 //
@@ -138,6 +138,12 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.files = files
 	m.maptask = make([]int8, m.nMap)
 	m.reducetask = make([]int8, nReduce)
+	for i := 0; i < m.nMap; i++ {
+		for j := 0; j < m.nReduce; j++ {
+			name := fmt.Sprintf("mr-%v-%v", i, j)
+			os.Remove(name)
+		}
+	}
 	m.server()
 	return &m
 }

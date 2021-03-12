@@ -56,14 +56,15 @@ func store(kv []KeyValue, m int) {
 			j++
 		}
 		r := hash(kv[i].Key)
-		oname := fmt.Sprintf("mr-%v-%v", m, r)
-		ofile, _ := os.Create(oname)
-		enc := json.NewEncoder(ofile)
+		name := fmt.Sprintf("mr-%v-%v", m, r)
+		tmpfile, _ := ioutil.TempFile("", "")
+		enc := json.NewEncoder(tmpfile)
 		for k := i; k < j; k++ {
 			enc.Encode(&kv[k])
 		}
 		i = j
-		ofile.Close()
+		tmpfile.Close()
+		os.Rename(tmpfile.Name(), name)
 	}
 }
 
@@ -109,8 +110,8 @@ func do_reduce(reducef func(string, []string) string, reply *JobReply) {
 
 
 	sort.Sort(ByKey(kva))
-	oname := fmt.Sprintf("mr-out-%v", id)
-	ofile, _ := os.Create(oname)
+	name := fmt.Sprintf("mr-out-%v", id)
+	tmpfile, _ := ioutil.TempFile("", "")
 
 	i := 0
 	for i < len(kva) {
@@ -123,10 +124,13 @@ func do_reduce(reducef func(string, []string) string, reply *JobReply) {
 			values = append(values, kva[k].Value)
 		}
 		output := reducef(kva[i].Key, values)
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(tmpfile, "%v %v\n", kva[i].Key, output)
 		i = j
 	}
-	ofile.Close()
+	tmpfile.Close()
+	os.Rename(tmpfile.Name(), name)
+	report := JobReport{2, id}
+	call("Master.JReport", &report, reply)
 }
 
 //
