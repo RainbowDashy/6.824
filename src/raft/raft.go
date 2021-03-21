@@ -272,6 +272,7 @@ func (rf *Raft) killed() bool {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rand.Seed(time.Now().UTC().UnixNano())
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -355,11 +356,10 @@ func (rf *Raft) leaderElection() {
 			return
 		}
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	DPrintf("Term %v: %v get %v votes!", rf.currentTerm, rf.me, vote)
 
+	DPrintf("Term %v: %v get %v votes!", rf.currentTerm, rf.me, vote)
 	if vote > len(rf.peers)/2 {
+		rf.mu.Lock()
 		DPrintf("Term %v: %v is leader!", rf.currentTerm, rf.me)
 		rf.state = LEADER
 		rf.nextIndex = make([]int, len(rf.peers))
@@ -367,7 +367,7 @@ func (rf *Raft) leaderElection() {
 		for i := range rf.nextIndex {
 			rf.nextIndex[i] = len(rf.log)
 		}
-		go rf.sendHeartbeat()
+		rf.sendHeartbeat()
 	}
 }
 
@@ -376,7 +376,6 @@ func (rf *Raft) sendHeartbeat() {
 		if i == rf.me {
 			continue
 		}
-		rf.mu.Lock()
 		go func(x, term int) {
 			for {
 				if rf.killed() {
@@ -394,29 +393,39 @@ func (rf *Raft) sendHeartbeat() {
 				DPrintf("Term %v: %v->%v", term, rf.me, x)
 				args := AppendEntriesArgs{term, rf.me, rf.commitIndex, rf.log[rf.commitIndex].Term, nil, rf.commitIndex}
 				reply := AppendEntriesReply{}
-				if rf.sendAppendEntries(x, &args, &reply) {
-					DPrintf("Term %v: %v->%v %v", rf.currentTerm, rf.me, x, reply.Success)
-					if reply.Term > rf.currentTerm {
-						rf.state = FOLLOWER
-						rf.currentTerm = reply.Term
+				go func(x int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+					if rf.sendAppendEntries(x, args, reply) {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						DPrintf("Term %v: %v->%v %v", rf.currentTerm, rf.me, x, reply.Success)
+						if reply.Term > rf.currentTerm {
+							rf.state = FOLLOWER
+							rf.currentTerm = reply.Term
+						}
 					}
-				}
+				}(x, &args, &reply)
 				rf.mu.Unlock()
 				time.Sleep(time.Millisecond * 100)
 			}
 		}(i, rf.currentTerm)
-		rf.mu.Unlock()
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) checkLeader() {
 	const sleepTime = time.Millisecond * 10
+	debugTime := time.Now()
 	electionTimeout := time.Millisecond * time.Duration(rand.Intn(100)+400)
+	name := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
 	for {
 		time.Sleep(sleepTime)
 
 		if rf.killed() {
 			return
+		}
+		if time.Since(debugTime) > time.Millisecond*100 {
+			DPrintf("Term %v: %v is %v", rf.currentTerm, rf.me, name[rf.state])
+			debugTime = time.Now()
 		}
 		if rf.state == FOLLOWER && time.Since(rf.prevTime) > electionTimeout {
 			rf.leaderElection()
@@ -446,10 +455,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	if rf.state == LEADER {
-		if args.Term > rf.currentTerm {
-			rf.state = FOLLOWER
-		}
+	if args.Term > rf.currentTerm {
+		rf.state = FOLLOWER
+		rf.currentTerm = args.Term
 	}
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
