@@ -89,8 +89,10 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
 	term := rf.currentTerm
 	isleader := rf.state == LEADER
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -286,12 +288,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) candidateTimer() {
+	timeout := time.Millisecond * time.Duration(450+rand.Intn(100))
 	for {
+		rf.mu.Lock()
 		if rf.state != CANDIDATE {
+			rf.mu.Unlock()
 			return
 		}
-		timeout := time.Millisecond * time.Duration(450+rand.Intn(100))
-		rf.mu.Lock()
 		if time.Since(rf.prevTime) > timeout {
 			rf.state = FOLLOWER
 			rf.votedFor = -1
@@ -303,7 +306,7 @@ func (rf *Raft) candidateTimer() {
 }
 
 func (rf *Raft) leaderElection() {
-	rf.mu.Lock()
+	// call with lock held
 
 	rf.state = CANDIDATE
 	rf.currentTerm++
@@ -323,13 +326,19 @@ func (rf *Raft) leaderElection() {
 		if i == rf.me {
 			continue
 		}
+		rf.mu.Lock()
 		if rf.state != CANDIDATE {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 		go func(id int) {
+			rf.mu.Lock()
 			if rf.state != CANDIDATE {
+				rf.mu.Unlock()
 				return
 			}
+			rf.mu.Unlock()
 			reply := RequestVoteReply{}
 			if rf.sendRequestVote(id, &args, &reply) {
 				if reply.VoteGranted {
@@ -345,19 +354,28 @@ func (rf *Raft) leaderElection() {
 			c <- reply.VoteGranted
 		}(i)
 	}
+
+	rf.mu.Lock()
 	DPrintf("Term %v: %v waiting...", rf.currentTerm, rf.me)
+	rf.mu.Unlock()
 
 	for vote <= len(rf.peers)/2 && count != len(rf.peers) {
 		if <-c {
 			vote++
 		}
 		count++
+		rf.mu.Lock()
 		if rf.state != CANDIDATE {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 	}
 
+	rf.mu.Lock()
 	DPrintf("Term %v: %v get %v votes!", rf.currentTerm, rf.me, vote)
+	rf.mu.Unlock()
+
 	if vote > len(rf.peers)/2 {
 		rf.mu.Lock()
 		DPrintf("Term %v: %v is leader!", rf.currentTerm, rf.me)
@@ -372,6 +390,7 @@ func (rf *Raft) leaderElection() {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	// call with lock held
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -419,17 +438,22 @@ func (rf *Raft) checkLeader() {
 	name := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
 	for {
 		time.Sleep(sleepTime)
-
+		rf.mu.Lock()
 		if rf.killed() {
+			rf.mu.Unlock()
 			return
 		}
 		if time.Since(debugTime) > time.Millisecond*100 {
 			DPrintf("Term %v: %v is %v", rf.currentTerm, rf.me, name[rf.state])
 			debugTime = time.Now()
 		}
+
 		if rf.state == FOLLOWER && time.Since(rf.prevTime) > electionTimeout {
 			rf.leaderElection()
+		} else {
+			rf.mu.Unlock()
 		}
+
 	}
 }
 
