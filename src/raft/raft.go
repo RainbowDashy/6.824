@@ -90,10 +90,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
-	term := rf.currentTerm
-	isleader := rf.state == LEADER
-	rf.mu.Unlock()
-	return term, isleader
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == LEADER
 }
 
 //
@@ -170,11 +168,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
-		rf.votedFor = -1
-	}
+	rf.checkTerm(args.Term)
 	if rf.currentTerm <= args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && leastUpToDate(args.LastLogTerm, args.LastLogIndex, rf.log[len(rf.log)-1].Term, len(rf.log)-1) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -290,11 +284,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) candidateTimer() {
 	timeout := time.Millisecond * time.Duration(450+rand.Intn(100))
 	for {
-		rf.mu.Lock()
-		if rf.state != CANDIDATE {
-			rf.mu.Unlock()
+		if !rf.checkState(CANDIDATE) {
 			return
 		}
+		rf.mu.Lock()
 		if time.Since(rf.prevTime) > timeout {
 			rf.state = FOLLOWER
 			rf.votedFor = -1
@@ -326,29 +319,20 @@ func (rf *Raft) leaderElection() {
 		if i == rf.me {
 			continue
 		}
-		rf.mu.Lock()
-		if rf.state != CANDIDATE {
-			rf.mu.Unlock()
+		if !rf.checkState(CANDIDATE) {
 			return
 		}
-		rf.mu.Unlock()
 		go func(id int) {
-			rf.mu.Lock()
-			if rf.state != CANDIDATE {
-				rf.mu.Unlock()
+			if !rf.checkState(CANDIDATE) {
 				return
 			}
-			rf.mu.Unlock()
 			reply := RequestVoteReply{}
 			if rf.sendRequestVote(id, &args, &reply) {
 				if reply.VoteGranted {
 					DPrintf("Term %v: %v got one vote from %v", rf.currentTerm, rf.me, id)
 				}
 				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.state = FOLLOWER
-					rf.currentTerm = reply.Term
-				}
+				rf.checkTerm(reply.Term)
 				rf.mu.Unlock()
 			}
 			c <- reply.VoteGranted
@@ -364,12 +348,9 @@ func (rf *Raft) leaderElection() {
 			vote++
 		}
 		count++
-		rf.mu.Lock()
-		if rf.state != CANDIDATE {
-			rf.mu.Unlock()
+		if !rf.checkState(CANDIDATE) {
 			return
 		}
-		rf.mu.Unlock()
 	}
 
 	rf.mu.Lock()
@@ -417,10 +398,7 @@ func (rf *Raft) sendHeartbeat() {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 						DPrintf("Term %v: %v->%v %v", rf.currentTerm, rf.me, x, reply.Success)
-						if reply.Term > rf.currentTerm {
-							rf.state = FOLLOWER
-							rf.currentTerm = reply.Term
-						}
+						rf.checkTerm(reply.Term)
 					}
 				}(x, &args, &reply)
 				rf.mu.Unlock()
@@ -479,10 +457,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.state = FOLLOWER
-		rf.currentTerm = args.Term
-	}
+	rf.checkTerm(args.Term)
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
 	}
@@ -519,4 +494,26 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (rf *Raft) print(format string, a ...interface{}) {
+	rf.mu.Lock()
+	DPrintf(format, a...)
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) checkTerm(term int) bool {
+	if rf.currentTerm < term {
+		rf.state = FOLLOWER
+		rf.currentTerm = term
+		rf.votedFor = -1
+		return false
+	}
+	return true
+}
+
+func (rf *Raft) checkState(state int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == state
 }
