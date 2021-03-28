@@ -352,12 +352,17 @@ func (rf *Raft) leaderElection() {
 	rf.mu.Unlock()
 
 	for vote <= len(rf.peers)/2 && count != len(rf.peers) {
-		if <-c {
-			vote++
-		}
-		count++
-		if !rf.checkState(CANDIDATE) {
-			return
+		select {
+		case v := <-c:
+			if v {
+				vote++
+			}
+			count++
+		default:
+			if !rf.checkState(CANDIDATE) {
+				return
+			}
+			time.Sleep(time.Millisecond * 10)
 		}
 	}
 
@@ -452,7 +457,11 @@ func (rf *Raft) sendHeartbeat(x, term int) {
 	prevLogTerm := -1
 	entries := make([]Log, 0)
 	if rf.nextIndex[x] < len(rf.log) {
-		entries = append(entries, rf.log[rf.nextIndex[x]])
+		if rf.matchIndex[x] >= prevLogIndex {
+			entries = append(entries, rf.log[rf.nextIndex[x]:]...)
+		} else {
+			entries = append(entries, rf.log[rf.nextIndex[x]])
+		}
 	}
 	if prevLogIndex < len(rf.log) { //always true?
 		prevLogTerm = rf.log[prevLogIndex].Term
