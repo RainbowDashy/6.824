@@ -469,7 +469,7 @@ func (rf *Raft) sendHeartbeat(x, term int) {
 				if rf.nextIndex[x] < len(rf.log) {
 					rf.nextIndex[x]++
 				}
-				rf.matchIndex[x] = max(rf.matchIndex[x], args.PrevLogIndex)
+				rf.matchIndex[x] = max(rf.matchIndex[x], args.PrevLogIndex+len(args.Entries))
 				// go rf.checkcommit()
 			} else {
 				DPrintf("Term %v: %v and %v disagree on index %v cause %v", rf.currentTerm, rf.me, x, args.PrevLogIndex, reply.Cause)
