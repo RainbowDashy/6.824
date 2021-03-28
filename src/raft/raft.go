@@ -19,6 +19,7 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,14 +53,9 @@ const (
 	LEADER    = 2
 )
 
-type KeyValue struct {
-	Key   string
-	Value string
-}
-
 type Log struct {
 	Term int
-	KV   KeyValue
+	Cmd  interface{}
 }
 
 //
@@ -169,6 +165,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	rf.checkTerm(args.Term)
+	if rf.state != FOLLOWER {
+		return
+	}
 	if rf.currentTerm <= args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && leastUpToDate(args.LastLogTerm, args.LastLogIndex, rf.log[len(rf.log)-1].Term, len(rf.log)-1) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -225,11 +224,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.state != LEADER {
+		return -1, -1, false
+	}
+
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := true
 	// Your code here (2B).
+
+	rf.log = append(rf.log, Log{term, command})
+	DPrintf("Term %v: Append %v", rf.currentTerm, command)
 
 	return index, term, isLeader
 }
@@ -278,6 +286,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.checkLeader()
+	go rf.checkApplied(applyCh)
 	return rf
 }
 
@@ -307,14 +316,13 @@ func (rf *Raft) leaderElection() {
 	rf.prevTime = time.Now()
 	vote := 1
 	count := 1
-	args := RequestVoteArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
-
 	DPrintf("Term %v: %v start to elect!", rf.currentTerm, rf.me)
 
 	go rf.candidateTimer()
 
 	rf.mu.Unlock()
 	c := make(chan bool)
+	args := RequestVoteArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -366,17 +374,122 @@ func (rf *Raft) leaderElection() {
 		for i := range rf.nextIndex {
 			rf.nextIndex[i] = len(rf.log)
 		}
-		rf.sendHeartbeat()
+		go rf.checkCommit()
+		rf.heartbeat()
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
+type KeyValue struct {
+	key   int
+	value int
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].key > a[j].key }
+
+func (rf *Raft) checkCommit() {
+	for {
+		if !rf.checkState(LEADER) {
+			return
+		}
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		cnt := make(map[int]int)
+		for i, v := range rf.matchIndex {
+			if i == rf.me {
+				cnt[len(rf.log)]++
+			} else {
+				cnt[v]++
+			}
+		}
+		kv := make([]KeyValue, len(cnt))
+		for i, v := range cnt {
+			kv = append(kv, KeyValue{i, v})
+		}
+		sort.Sort(ByKey(kv))
+		t := 0
+		for _, v := range kv {
+			t += v.value
+			if v.key <= rf.commitIndex {
+				break
+			}
+			if t > len(rf.peers)/2 && rf.log[v.key].Term == rf.currentTerm {
+				DPrintf("Term %v: Commit Index %v -> %v", rf.currentTerm, rf.commitIndex, v.key)
+				rf.commitIndex = v.key
+				break
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 33)
+	}
+}
+
+func (rf *Raft) checkApplied(applyCh chan ApplyMsg) {
+	for {
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			// rf apply to state machine
+			index := rf.lastApplied
+			msg := ApplyMsg{true, rf.log[index].Cmd, index}
+			applyCh <- msg
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 10)
+	}
+}
+
+func (rf *Raft) sendHeartbeat(x, term int) {
+	prevLogIndex := rf.nextIndex[x] - 1
+	prevLogTerm := -1
+	entries := make([]Log, 0)
+	if rf.nextIndex[x] < len(rf.log) {
+		entries = append(entries, rf.log[rf.nextIndex[x]])
+	}
+	if prevLogIndex < len(rf.log) { //always true?
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+	args := AppendEntriesArgs{term, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
+	reply := AppendEntriesReply{}
+	go func(x int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+		if rf.sendAppendEntries(x, args, reply) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			DPrintf("Term %v: %v->%v %v (index %v)", rf.currentTerm, rf.me, x, reply.Success, prevLogIndex)
+			rf.checkTerm(reply.Term)
+			if reply.Success {
+				if rf.nextIndex[x] < len(rf.log) {
+					rf.nextIndex[x]++
+				}
+				rf.matchIndex[x] = max(rf.matchIndex[x], args.PrevLogIndex)
+				// go rf.checkcommit()
+			} else {
+				DPrintf("Term %v: %v and %v disagree on index %v cause %v", rf.currentTerm, rf.me, x, args.PrevLogIndex, reply.Cause)
+				if rf.nextIndex[x] > 1 {
+					rf.nextIndex[x]--
+				}
+
+			}
+		}
+	}(x, &args, &reply)
+}
+
+func (rf *Raft) heartbeat() {
 	// call with lock held
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 		go func(x, term int) {
+
 			for {
 				if rf.killed() {
 					return
@@ -391,19 +504,11 @@ func (rf *Raft) sendHeartbeat() {
 					return
 				}
 				DPrintf("Term %v: %v->%v", term, rf.me, x)
-				args := AppendEntriesArgs{term, rf.me, rf.commitIndex, rf.log[rf.commitIndex].Term, nil, rf.commitIndex}
-				reply := AppendEntriesReply{}
-				go func(x int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-					if rf.sendAppendEntries(x, args, reply) {
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-						DPrintf("Term %v: %v->%v %v", rf.currentTerm, rf.me, x, reply.Success)
-						rf.checkTerm(reply.Term)
-					}
-				}(x, &args, &reply)
+				rf.sendHeartbeat(x, term)
 				rf.mu.Unlock()
 				time.Sleep(time.Millisecond * 100)
 			}
+
 		}(i, rf.currentTerm)
 	}
 	rf.mu.Unlock()
@@ -412,7 +517,7 @@ func (rf *Raft) sendHeartbeat() {
 func (rf *Raft) checkLeader() {
 	const sleepTime = time.Millisecond * 10
 	debugTime := time.Now()
-	electionTimeout := time.Millisecond * time.Duration(rand.Intn(100)+400)
+	electionTimeout := time.Millisecond * time.Duration(rand.Intn(100)+300)
 	name := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
 	for {
 		time.Sleep(sleepTime)
@@ -447,6 +552,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	Cause   int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -455,26 +561,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	if args.Term < rf.currentTerm {
+		reply.Cause = 0
 		return
 	}
-	rf.checkTerm(args.Term)
+	if !rf.checkTerm(args.Term) {
+		rf.votedFor = args.LeaderId
+	}
 	if rf.state == CANDIDATE {
 		rf.state = FOLLOWER
+		rf.votedFor = args.LeaderId
 	}
 	if rf.state == FOLLOWER {
-		if args.PrevLogIndex > len(rf.log) {
+		if rf.votedFor != args.LeaderId {
+			reply.Cause = 1
+			DPrintf("Term %v: %v is no the leader of %v", args.Term, args.LeaderId, rf.me)
 			return
 		}
-		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			rf.log = rf.log[:args.PrevLogIndex]
-			return
-		}
-		rf.currentTerm = args.Term
 		rf.prevTime = time.Now()
-		if args.Entries != nil {
-			rf.log = append(rf.log, args.Entries...)
+		logIndex := args.PrevLogIndex
+		if logIndex >= len(rf.log) {
+			reply.Cause = 2
+			return
+		}
+		logTerm := rf.log[logIndex].Term
+		if logTerm != args.PrevLogTerm {
+			reply.Cause = 3
+			return
+		}
+		pos := logIndex + 1
+		for i, v := range args.Entries {
+			if pos >= len(rf.log) {
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+			if rf.log[pos].Term != v.Term {
+				rf.log = rf.log[:pos]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+			pos++
 		}
 		if args.LeaderCommit > rf.commitIndex {
+			DPrintf("Term %v: %v's commit index %v->%v", rf.currentTerm, rf.me, rf.commitIndex, min(args.LeaderCommit, len(rf.log)-1))
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
 		reply.Success = true
@@ -491,6 +619,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
