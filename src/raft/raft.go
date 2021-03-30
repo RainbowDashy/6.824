@@ -209,6 +209,83 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+	Cause   int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	if args.Term < rf.currentTerm {
+		reply.Cause = 0
+		return
+	}
+	if !rf.checkTerm(args.Term) {
+		rf.votedFor = args.LeaderId
+	}
+	if rf.state == CANDIDATE {
+		rf.state = FOLLOWER
+		rf.votedFor = args.LeaderId
+	}
+	if rf.state == FOLLOWER {
+		if rf.votedFor != args.LeaderId {
+			reply.Cause = 1
+			DPrintf("Term %v: %v is no the leader of %v", args.Term, args.LeaderId, rf.me)
+			return
+		}
+		rf.prevTime = time.Now()
+		logIndex := args.PrevLogIndex
+		if logIndex >= len(rf.log) {
+			reply.Cause = 2
+			return
+		}
+		logTerm := rf.log[logIndex].Term
+		if logTerm != args.PrevLogTerm {
+			reply.Cause = 3
+			return
+		}
+		pos := logIndex + 1
+		for i, v := range args.Entries {
+			if pos >= len(rf.log) {
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+			if rf.log[pos].Term != v.Term {
+				rf.log = rf.log[:pos]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+			pos++
+		}
+		if args.LeaderCommit > rf.commitIndex {
+			DPrintf("Term %v: %v's commit index %v->%v", rf.currentTerm, rf.me, rf.commitIndex, min(args.LeaderCommit, len(rf.log)-1))
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		}
+		reply.Success = true
+		DPrintf("%v recognize %v as Leader", rf.me, args.LeaderId)
+		return
+	}
+
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -304,6 +381,7 @@ func (rf *Raft) candidateTimer() {
 			return
 		}
 		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 10)
 	}
 }
 
@@ -322,7 +400,12 @@ func (rf *Raft) leaderElection() {
 
 	rf.mu.Unlock()
 	c := make(chan bool)
-	args := RequestVoteArgs{rf.currentTerm, rf.me, len(rf.log) - 1, rf.log[len(rf.log)-1].Term}
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -439,7 +522,6 @@ func (rf *Raft) checkApplied(applyCh chan ApplyMsg) {
 		if rf.killed() {
 			return
 		}
-		rf.mu.Lock()
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			// rf apply to state machine
@@ -447,7 +529,6 @@ func (rf *Raft) checkApplied(applyCh chan ApplyMsg) {
 			msg := ApplyMsg{true, rf.log[index].Cmd, index}
 			applyCh <- msg
 		}
-		rf.mu.Unlock()
 		time.Sleep(time.Millisecond * 10)
 	}
 }
@@ -466,7 +547,14 @@ func (rf *Raft) sendHeartbeat(x, term int) {
 	if prevLogIndex < len(rf.log) { //always true?
 		prevLogTerm = rf.log[prevLogIndex].Term
 	}
-	args := AppendEntriesArgs{term, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
 	reply := AppendEntriesReply{}
 	go func(x int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 		if rf.sendAppendEntries(x, args, reply) {
@@ -547,83 +635,6 @@ func (rf *Raft) checkLeader() {
 		}
 
 	}
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []Log
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-	Cause   int
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.Success = false
-	if args.Term < rf.currentTerm {
-		reply.Cause = 0
-		return
-	}
-	if !rf.checkTerm(args.Term) {
-		rf.votedFor = args.LeaderId
-	}
-	if rf.state == CANDIDATE {
-		rf.state = FOLLOWER
-		rf.votedFor = args.LeaderId
-	}
-	if rf.state == FOLLOWER {
-		if rf.votedFor != args.LeaderId {
-			reply.Cause = 1
-			DPrintf("Term %v: %v is no the leader of %v", args.Term, args.LeaderId, rf.me)
-			return
-		}
-		rf.prevTime = time.Now()
-		logIndex := args.PrevLogIndex
-		if logIndex >= len(rf.log) {
-			reply.Cause = 2
-			return
-		}
-		logTerm := rf.log[logIndex].Term
-		if logTerm != args.PrevLogTerm {
-			reply.Cause = 3
-			return
-		}
-		pos := logIndex + 1
-		for i, v := range args.Entries {
-			if pos >= len(rf.log) {
-				rf.log = append(rf.log, args.Entries[i:]...)
-				break
-			}
-			if rf.log[pos].Term != v.Term {
-				rf.log = rf.log[:pos]
-				rf.log = append(rf.log, args.Entries[i:]...)
-				break
-			}
-			pos++
-		}
-		if args.LeaderCommit > rf.commitIndex {
-			DPrintf("Term %v: %v's commit index %v->%v", rf.currentTerm, rf.me, rf.commitIndex, min(args.LeaderCommit, len(rf.log)-1))
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		}
-		reply.Success = true
-		DPrintf("%v recognize %v as Leader", rf.me, args.LeaderId)
-		return
-	}
-
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
 }
 
 func min(a, b int) int {
